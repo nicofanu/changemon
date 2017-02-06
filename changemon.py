@@ -1,41 +1,105 @@
 #!/usr/bin/env python
-# TODO: fix TWO functions having SAME NAME - it's confusing
-# TODO: decouple tree difference check from tree comparison function
 # TODO: timestamps in monitor mode output
-# Idea: cache results for quick rescanning, update cache when modified attrib of a scanned folder changes
 
-DESC="""  changemon.py - Monitor a directory for changes or compare two directories
+DESC="""  changemon.py - Compare or monitor filesystem directory changes
 
-In the first mode, two directories are compared. In the second mode, a single directory is monitored for changes. The goal is to provide an easy-to-read summary of changes. 
+Changemon produces an easy-to-read summary of changes in two modes: In the
+first, two directories are compared. In the second mode, a single directory is
+monitored for changes as they occur.
 """
 
 NOTES="""
+Notes: Changed files are determined by comparing file sizes, and where two
+files have the same size, a comparison of their md5 checksums is done (unless
+--skip-checksums is supplied). Md5 checks are not done in watch mode.
+
 Flags:
 
-Files and directories belong to one of the added, removed, or changed groups. Additionally, the unchanged and "shared" (in common to both directories, whether changed or not) groups are available, but only in the first mode. The groups to display are specified by flags - a string of any of the characters "acrsu" (the characters correspond to the first letters of the group names) supplied to the --flags option which will also determine the presented order of the groups. By default, ommitting --flags will produce the same result as if --flags "car" had been typed at the command-line..
+Use flags to select which information to show, The --flags options takes:
+
+a - added files
+r - removed
+c - changed
+s - files in common to both directories
+u - files shared by both directories that have not changed
+
+"Watch mode" does not support --flags "su". Ommitting --flags produces the same
+result as --flags "acr". The order of flags will be preserved, so --flags "acr"
+order the results differently than --flags "car".
 
 Examples:
 
 Compare foo_v1 to foo_v2 to show files that were changed, added and removed:
-  $ changemon.py ~/projects/foo_v1 ~/projects/foo_v2
+$changemon.py -c ~/projects/foo_v1 ~/projects/foo_v2
 
-Notes:
-Changed files are determined by comparing file sizes, and where two files have the same size, a comparison of their md5 checksums is done (unless --skip-checksums is supplied).
+Watch the current directory for changes as they occur
+$ changemon.py -w
+
+Watch ~/projects/foo
+$ changemon.py -w ~/projects/foo
+
+Author: github.com/nicofanu
 
 """
 
 import argparse
-import functools
 import hashlib
 import os
 import sys
-import textwrap
 import time
+import operator
+from functools import partial
+
+join, commonprefix = os.path.join, os.path.commonprefix
+
+class monitor(object):
+    files_stats = {}
+
+    def __init__(self, criteria, target, interval):
+        self.criteria   = criteria
+        self.target     = target
+        self.interval   = interval
+        self.before     = []
+        self.after      = []
+        self.initial_tree = self.get_tree()
+
+    def get_tree(self):
+        tree = list(os.walk(self.target, followlinks=True, onerror=report))
+        return collapse(tree)
+
+    def get_stats(self, tree):
+        stats = {}
+        for f in tree:
+            if not f.endswith(os.path.sep):
+                fpath = join(self.target, f)
+                stats[f] = {'size': os.path.getsize(fpath),
+                            'mtime': os.path.getmtime(fpath)}
+        return stats
+
+    def start(self):
+        stats = monitor.files_stats
+        stats['before'] = {}
+        stats['after'] = {}
+        while True:
+            self.before = self.after[:] if self.after else self.initial_tree
+            stats['before'] = stats['after'].copy() if stats['after'] else self.get_stats(self.before)
+
+            time.sleep(self.interval)
+
+            self.after = self.get_tree()
+            stats['after'] = self.get_stats(self.after)
+
+            compared = comparison(criteria, self.before, self.after)
+            pretty_watch(compared)
+
+    def stop(self):
+        print
+        sys.exit(0)
 
 
 def parse_args():
-    ap = argparse.ArgumentParser(description=textwrap.dedent(DESC),
-                                 epilog=textwrap.dedent(NOTES),
+    ap = argparse.ArgumentParser(description=DESC,
+                                 epilog=NOTES,
                                  formatter_class=argparse.RawTextHelpFormatter)
 
     mode = ap.add_mutually_exclusive_group(required=True)
@@ -54,55 +118,153 @@ def parse_args():
                     nargs='?', metavar='DIR', default=os.getcwd())
     ap.add_argument('-i', '--interval',
                     help='update interval in seconds for watch mode',
-                    metavar='N', type=int, default=10)
+                    metavar='N', type=int, default=5)
     ap.add_argument('-x', '--cutoff',
-                    help='amount of files to list for each group before displaying "and N more" in watch mode output',
+                    help='amount of files to list for each group summary in watch mode',
                     metavar='N', type=int, default=3)
 
     return ap.parse_args()
 
 
-def report(err):
-    """ Error-reporting function for os.walk() """
-    raise err
+def memoize(fn):
+    def inner(*args, **kwargs):
+        key = (args, kwargs)
+        first_run = 'cache' not in fn.__dict__
+        if first_run:
+            result = fn(*args, **kwargs)
+            fn.cache = [(key, result)]
+        else:
+            key_match = lambda tup: key == tup[0]
+            match = filter(key_match, fn.cache)
+            if match:
+                result = match[0][1]
+            else:
+                result = fn(*args, **kwargs)
+                fn.cache.append((key, result))
+        return result
+    return inner
+            
 
+def collapse(tree, strip_root=True):
+    """ Takes a list of 3-tuples (as generated by os.walk) and returns a flat list 
 
-def checksum(f):
-    with open(f, 'rb') as fh:
-        contents = fh.read()
-    m = hashlib.md5()
-    m.update(contents)
-    return m.digest()
+    Directories are signified by trailing slashes.
+    
+        >>> listing = list(os.walk('.')) 
+        >>> listing
+        [('.', ['.gitignore', 'tags', 'changemon.py'], ['.git']),
+        ('.git', ..., ...)]
+        >>> collapse(listing)
+        ['.gitignore', 'tags', 'changemon.py',
+        '.git/', ..., ...]
+        >>> collapse(listing, strip_root=False)
+        ['./', './.gitignore', './tags', './changemon.py',
+        './.git/', ..., ...]
+    """
+    
+    add_sep = lambda s: join(s, '')     # adds path separator... do NOT use os.path.sep!
 
+    genesis = add_sep(tree[0][0])
+    
+    if strip_root:
+        collapsed = []
+        add_prefix = lambda root, f: join(root, f).replace(genesis, '', 1)
+    else:
+        collapsed = [genesis]
+        add_prefix = lambda root, f: join(root, f)
 
-def get_checksums(tree):
-    checksums = {}
     for root, dirs, files in tree:
-        for f in files:
-            fname = os.path.join(root, f)
-            checksums[fname] = checksum(fname)
-    return checksums
+        files_and_dirs = files + map(add_sep, dirs)
+        collapsed.extend([add_prefix(root, f) for f in files_and_dirs])
+    
+    return collapsed
 
 
-def differing(files, skip_checksum=False):
-    """ Return True when two files differ """
+def collapse_args(strip_root=True):
+    """ Decorator to collapse trees as necessary for our comparison functions
+    
+    This allows us to pass in either lists of 3-tuples from os.walk(), or such
+    lists that have already been run through collapse(), to our comparison
+    functions. """
 
-    def comparison(func, file1, file2):
-        file1, file2 = map(func, [file1, file2])
-        #print "file1: %s, file2: %s, differ: %s" % (file1, file2, return_if(file1 != file2))
-        return file1 != file2
+    def decorator(fn):
+        def inner(before, after):
+            _collapse = partial(collapse, strip_root=strip_root)
+            if type(before[0]) == tuple:
+                before, after = _collapse(before), _collapse(after)
+            return fn(before, after)
+        return inner
+    return decorator
 
-    # if sizes differ, it's true that files aren't the same
-    if comparison(os.path.getsize, *files):
-        return True
 
-    # if sizes don't differ, check md5sums for accuracy
-    elif skip_checksum == False:
-        return comparison(checksum, *files)
+def strip_roots(seq):           return [s.replace(seq[0], '', 1) for s in seq][1:]
 
-    # or check modification time instead
-    elif skip_checksum == True:
-        return comparison(os.path.getmtime, *files)
+########## Comparison functions ################################################
+
+@collapse_args()                       # a - b
+def added(before, after):       return [p for p in after if not p in before]
+
+@collapse_args()                       # b - a
+def removed(before, after):     return [p for p in before if p not in after]
+
+@collapse_args()
+@memoize                               # intersection(b, a)
+def common(before, after):      return [p for p in before if p in after]
+
+@collapse_args(strip_root=False)
+@memoize
+def shared_files(before, after):       # files in common excluding directories
+    before, after = strip_roots(before), strip_roots(after)
+    return [p for p in common(before, after) if not p.endswith(os.path.sep)] 
+
+@collapse_args(strip_root=False)
+@memoize
+def changed(before, after):            # filter common_files by differing stats
+    _shared_files       = shared_files(before, after)
+    root1, root2        = before[0], after[0]
+    common_with_roots   = [(join(root1, p), join(root2, p)) for p in _shared_files]
+    changed_with_roots  = filter(differing, common_with_roots)
+    return strip_roots([root1] + [p[0] for p in changed_with_roots])
+
+@collapse_args(strip_root=False)
+def changed_stateful(before, after):
+    stats = monitor.files_stats     # functional programming is hard, okay!
+    _shared_files = shared_files(before, after)
+    _changed = []
+    for f in _shared_files:
+        if f in stats['before']:
+            old = stats['before'][f]
+            new = stats['after'][f]
+            if old['size'] != new['size'] or old['mtime'] != new['mtime']:
+                _changed.append(f)
+    return _changed
+
+@collapse_args(strip_root=False)       # common_files - changed_files
+def unchanged(before, after):           
+    _shared_files       = shared_files(before, after)
+    _changed            = changed(before, after)
+    return [p for p in _shared_files if not p in _changed]
+
+################################################################################
+
+def comparison(criteria, tree1, tree2):
+    """ Return differences between two trees as requested in criteria
+    
+        >>> criteria
+        [('Added', added),      # added is a function
+         ('Removed', removed)]
+        >>> comparison(tree1, tree2, criteria)
+        [('Added', [files...]),
+         ('Removed', [files...])]
+
+    """
+
+    results = []
+    for label, fn in criteria:
+        data = fn(tree1, tree2)
+        results += [(label, sorted(data))]
+    
+    return results
 
 
 def pretty_compare(results):
@@ -116,7 +278,9 @@ def pretty_compare(results):
             files_string = ''
         return '{}\n{}\n{}'.format(label, '-' * len(label), files_string)
 
-    print '\n'.join(map(make_group, results))
+    output = map(make_group, results)
+
+    print '\n'.join(output)
 
 
 def pretty_watch(results, cutoff=3):
@@ -136,142 +300,76 @@ def pretty_watch(results, cutoff=3):
     if output: print '\n'.join(output)
 
 
-def comparison(flags, t1, t2, skip_checksum=False):
-    """ Return differences between two trees generated by os.walk() """
+def differing(files, skip_checksum=False):
+    """ Return True when two files differ - "files" must be a tuple """
 
-    # this function is just really ugly and confusing!
+    # return file1 != file2
+    check = lambda fn, file1, file2: operator.ne(*map(fn, [file1, file2]))
 
-    join, commonprefix = os.path.join, os.path.commonprefix
+    # if sizes differ, it's true that the files aren't identical
+    if check(os.path.getsize, *files):
+        return True
 
-    def with_sep(s):
-        """ Add path separator to end of path string """
-        return join(s, '')
+    # if sizes don't differ, check md5sums for accuracy
+    elif skip_checksum == False:
+        return check(checksum, *files)
 
-    def erase_from(s, sub):
-        """ Remove first count of substring from s """
-        # is safe because common prefix is guaranteed to be first substring in s
-        return s.replace(sub, '', 1)
-
-    def full_listing(t):
-        """ Flat list of files and directories of t, with items preceded by root name """
-        dir_listing = []
-        for root, dirs, files in t:
-            dir_listing.extend([join(root, i)
-                               for i in files + [with_sep(d) for d in dirs]])
-        return dir_listing
-
-    def stripped_listing(root, l):
-        """ Flat list of files and directories with root path stripped """
-        return [erase_from(s, with_sep(commonprefix([root] + l))) for s in l] 
-
-    root1, root2           =  t1[0][0], t2[0][0]
-    before, after          =  full_listing(t1), full_listing(t2)
-    before_str, after_str  =  stripped_listing(root1, before), stripped_listing(root2, after)
-
-    added = [p for p in after_str if not p in before_str]
-
-    removed = [p for p in before_str if not p in after_str]
-    
-    common = [p for p in after_str if not p in added]
-
-    common_with_roots = [(join(root1, p), join(root2, p))
-                          for p in common if not p.endswith(os.path.sep)]
-
-    if 'c' in flags or 'u' in flags:
-        differingp = functools.partial(differing, skip_checksum=skip_checksum)
-
-        changed = [erase_from(p[0], with_sep(root1))
-                   for p in filter(differingp, common_with_roots)]
-
-        unchanged = [p for p in common
-                     if not p in changed and not p.endswith(os.path.sep)]
-
-    groups = [('a', 'Added',        added),
-              ('c', 'Changed',      changed),
-              ('r', 'Removed',      removed),
-              ('s', 'Shared',       common),
-              ('u', 'Unchanged',    unchanged)]
-
-    results = []
-    for f in flags.lower():
-        for char, label, data in groups:
-            if char == f:
-                results += [(label, sorted(data))]
-                break
-
-    return results
+    # or check modification time instead
+    elif skip_checksum == True:
+        return check(os.path.getmtime, *files)
 
 
-def monitor(source):
-    """ Loop for monitor mode """
+def checksum(f):
+    with open(f, 'rb') as fh:
+        contents = fh.read()
+    m = hashlib.md5()
+    m.update(contents)
+    return m.digest()
 
-    while os.path.exists(args.watch):
-        try:
-            try:
-                cur_state
-                first_run = False
-            except NameError:
-                cur_state = []
-                first_run = True
 
-            if first_run: 
-                pre_state = list(os.walk(args.watch, followlinks=True, onerror=report))
-            else:
-                pre_state = cur_state[:]
-
-            if not args.skip_checksum:
-                pre_checksums = get_checksums(pre_state)
-
-            time.sleep(args.interval)
-
-            cur_state = list(os.walk(args.watch, followlinks=True, onerror=report))
-
-            if not args.skip_checksum:
-                cur_checksums = get_checksums(cur_state)
-
-            if args.flags.find('s') == -1:
-                args.flags += 's'
-
-            trees = [pre_state, cur_state]
-            compared = comparison(args.flags, *trees, skip_checksum=True)
-
-            ## FUCK! To compare the checksums in this way I have to write similar functionality
-            ## already in comparison() AGAIN!
-
-            changed = []
-            for i, tup in enumerate(compared[:]):
-                label, seq = tup
-                if label == "Shared":
-                    for fname in seq:
-                        key = os.path.join(pre_state[0][0], fname)
-                        if key in pre_checksums:
-                            if pre_checksums[key] != cur_checksums[key]:
-                                changed.append(fname)
-                    del compared[i]        
-                    break
-
-            for i, tup in enumerate(compared[:]):
-                label, seq = tup
-                if label == "Changed":
-                    compared[i] = ('Changed', changed)
-                break
-
-            pretty_watch(compared, cutoff=args.cutoff)
-        except KeyboardInterrupt:
-            print
-            break
+def report(err): raise err # Error-reporting function for os.walk() 
 
 
 if __name__ == '__main__':
 
-    args = parse_args()
+    args         = parse_args()
+
+    differing    = partial(differing, skip_checksum=args.skip_checksum)
+    pretty_watch = partial(pretty_watch, cutoff=args.cutoff)
+
+    flags        = args.flags.lower()
+    initial      = lambda tup: tup[0][0]
+    get_flagged  = partial(filter, lambda s: initial(s).lower() in flags)
+    sort_by_flag = partial(sorted, key=lambda s: flags.find(initial(s)))
 
     # comparison mode: compare two directories
     if args.compare:
-        trees = [list(os.walk(d, followlinks=True, onerror=report))
-                 for d in args.compare]
-        pretty_compare(comparison(args.flags, *trees, skip_checksum=args.skip_checksum))
+
+        table = [('Added',      added),
+                 ('Changed',    changed),
+                 ('Removed',    removed),
+                 ('Shared',     common),
+                 ('Unchanged',  unchanged)]
+
+        criteria  = sort_by_flag(get_flagged(table)) 
+
+        make_tree = lambda d: list(os.walk(d, followlinks=True, onerror=report))
+        trees     = map(make_tree, args.compare)
+
+        pretty_compare(comparison(criteria, *trees))
 
     # watch mode: monitor a directory for changes in a continuous loop
     elif args.watch:
-        monitor(args.watch)
+
+        table = [('Added',      added),
+                 ('Changed',    changed_stateful),
+                 ('Removed',    removed)]
+
+        criteria = sort_by_flag(get_flagged(table)) 
+        
+        Monitor = monitor(criteria, args.watch, args.interval)
+
+        try:
+            Monitor.start()
+        except KeyboardInterrupt:
+            Monitor.stop()
